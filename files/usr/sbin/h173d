@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.6.3';
+const VERSION = '0.6.4';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -558,6 +558,11 @@ function phone_list(s) {
  *  classic - what the Huawei AI Life app does: plain /api/sms/sms-list (BoxType 1 inbox, 2 outbox)
  * sms_mode 'auto' tries ecc first and falls back to classic when the device refuses it. */
 const SMS_FALLBACK = { nokey: 1, rsa: 1, ecdh: 1, decrypt: 1, '100002': 1, '100005': 1, '100006': 1, http404: 1, http400: 1 };
+// GÖNDERME için dar fallback: yalnızca istek modeme ULAŞMADAN önce oluşan hatalar.
+// 'decrypt'/'timeout'/100xxx gibi yanıt-sonrası belirsiz hatalarda klasik yola DÜŞMEYİZ;
+// çünkü mesaj modeme gitmiş olabilir ve yeniden göndermek MÜKERRER SMS'e yol açar
+// (tek-oturumlu modemde bağlantı çakışınca tam bu oluyordu).
+const SEND_FALLBACK = { nokey: 1, rsa: 1, ecdh: 1, http404: 1, http400: 1 };
 
 // "Kayıt yok / boş liste" kodları: modem boş SMS deposunu sorgulayınca hata döndürür.
 // Bunları hata değil BOŞ LİSTE olarak ele alıyoruz. Klasik fallback'e DÜŞMÜYORUZ: o,
@@ -574,7 +579,8 @@ function sms_reply_list(req, e, r) {
 	req.reply({ ok: true, mode: sms_mode_used, ...r });
 }
 
-function sms_dispatch(name, ecc_fn, classic_fn, done) {
+function sms_dispatch(name, ecc_fn, classic_fn, done, fb) {
+	fb = fb ?? SMS_FALLBACK;
 	let mode = cfg.sms_mode ?? 'auto';
 	if (mode == 'classic' || (mode == 'auto' && sms_mode_used == 'classic'))
 		return classic_fn((e, v) => { if (!e) sms_mode_used = 'classic'; done(e, v); });
@@ -584,7 +590,7 @@ function sms_dispatch(name, ecc_fn, classic_fn, done) {
 			sms_mode_used = 'ecc';
 			return done(null, v);
 		}
-		if (mode == 'auto' && code && SMS_FALLBACK[code])
+		if (mode == 'auto' && code && fb[code])
 			return classic_fn((e2, v2) => {
 				if (!e2)
 					sms_mode_used = 'classic';
@@ -670,13 +676,16 @@ function sms_send(req, to, text) {
 		return reply_err(req, 'empty message');
 	let mode = text_mode(text);
 
+	let tlen = utf16_len(text);              // UZUNLUK ham metnin karakter sayısıdır;
+	                                         // kaçışlı (escaped) içeriğin değil — yoksa
+	                                         // & < > ( ) / ' " içeren mesajlar bozulur.
 	let ecc_send = (k) => {
 		let content = ui_escape(text);       // web UI: xss() then raw into the XML
-		sess.post_enc('/api/sms/send-sms', send_xml(phones, content, utf16_len(content), mode), 2, (e, v) => k(e, e ? null : 'ecc'), { timeout: 30000 });
+		sess.post_enc('/api/sms/send-sms', send_xml(phones, content, tlen, mode), 2, (e, v) => k(e, e ? null : 'ecc'), { timeout: 30000 });
 	};
 	let classic_send = (k) => {
 		// app: plain XML, normal XML escaping, SendType 0
-		sess.post('/api/sms/send-sms', send_xml(phones, P.xml_escape(text), utf16_len(text), mode, '<SendType>0</SendType>'),
+		sess.post('/api/sms/send-sms', send_xml(phones, P.xml_escape(text), tlen, mode, '<SendType>0</SendType>'),
 			(e, v) => k(e, e ? null : 'classic'), { timeout: 30000 });
 	};
 
@@ -686,7 +695,7 @@ function sms_send(req, to, text) {
 		sms_wait((cb) => (used == 'classic')
 			? sess.get('/api/sms/send-status', cb)
 			: sess.post_enc('/api/sms/send-status', {}, 1, cb), req);
-	});
+	}, SEND_FALLBACK);
 }
 
 const methods = {

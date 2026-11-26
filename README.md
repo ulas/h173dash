@@ -9,7 +9,14 @@ bağlan, LTE bant seçimi ve 5G modunu (NSA/SA) yaz.
 - **Panel:** `http://<router-ip>/` adresinde (otomatik `/dash/`'e yönlendirir).
 - **Giriş:** router'ın **kendi root parolası** (LuCI girişi ile aynı — rpcd oturumu).
 - **Modem parolası:** ayrıca `/etc/config/h173` içinde tutulur (daemon modeme bununla bağlanır).
-- LuCI arayüzünü **değiştirmez**, yanında çalışır.
+- **Sadece 5G modem:** Panel yalnızca modemle ilgili kategorileri gösterir (Ana Sayfa,
+  Ağ & Bant, Hücreler, Analiz, Mesajlar, Modem). Router/OpenWrt ayarları için başlıktaki
+  **Router** düğmesi LuCI arayüzünü açar. LuCI'yi **değiştirmez**, yanında çalışır.
+- **Ham API konsolu** (Modem → Ham API): modemin açık tüm uçlarını tek tıkla sorgular,
+  ham yanıtın altında **yorumlanmış tablo** gösterir.
+- **Tek oturum:** H173 aynı anda tek web oturumuna izin verir. Modemin kendi arayüzü veya
+  AI Life açıkken panel kısa süre "bekliyor" gösterebilir; diğer taraf kapanınca saniyeler
+  içinde bağlanır (başlıktaki durum rozeti bunu belirtir).
 - Renk paleti **luci-theme-hx21** ile aynıdır (adaçayı/bej/ink + Montserrat + Lucide).
 
 ## Ekran görüntüleri
@@ -19,6 +26,8 @@ bağlan, LTE bant seçimi ve 5G modunu (NSA/SA) yaz.
 ![Hücreler](docs/cells.png)
 ![Analiz](docs/analysis.png)
 ![SMS](docs/sms.png)
+![Eylemler ve SIM durumu](docs/actions.png)
+![Ham API — yorumlanmış tablo](docs/rawapi.png)
 ![Giriş](docs/login.png)
 
 ---
@@ -208,6 +217,14 @@ Kaldırmadan sonra tarayıcıyı **Ctrl+Shift+R** ile yenileyin.
 ---
 
 ## Sorun giderme
+
+**Başlıkta "bekliyor" / "bağlı değil" yazıyor**
+- H173 **aynı anda tek web oturumuna** izin verir. Modemin kendi web arayüzünü
+  (`192.168.8.1`) başka bir sekmede ya da **AI Life** uygulamasını açık bıraktıysanız,
+  oturumu onlar tutar ve panel kısa süre bekler. Diğer tarafı kapatın; panel saniyeler
+  içinde yeniden bağlanır (durum rozeti geri sayımı gösterir).
+- "giriş durdu" yazıyorsa modem parolası yanlıştır (ard arda denemeler modemi de kilitler);
+  Modem → Modem Bağlantısı'ndan parolayı düzeltin.
 
 **Panel açılmıyor / boş sayfa**
 - `http://<router-ip>/dash/` adresini doğrudan deneyin.

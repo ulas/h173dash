@@ -442,10 +442,13 @@ export function session(cfg) {
 			self.login_block_until = time() + max(+(e?.waittime ?? 0) * ((+(e?.waittime ?? 0) > 1000) ? 0.001 : 1), cfg.login_backoff ?? 300) + 5;
 			self.fail_streak = 0;
 		}
-		// anything else (protocol/HTTP error, device busy): growing pause 15s..5min
+		// anything else (protokol/HTTP hatası, cihaz meşgul, oturum başka yerde açık):
+		// tek-oturumlu modemde bu çoğu zaman GEÇİCİdir (web arayüzü/AI Life oturumu
+		// almıştır), diğer taraf kapanınca hemen düzelir. Bu yüzden kısa, hızlı
+		// toparlayan bir bekleme: 6s,12s,24s,48s,90s (eski 15s..5dk yerine).
 		else {
 			self.fail_streak = (self.fail_streak ?? 0) + 1;
-			self.login_block_until = time() + min(300, 15 * (1 << min(self.fail_streak - 1, 5)));
+			self.login_block_until = time() + min(90, 6 * (1 << min(self.fail_streak - 1, 4)));
 		}
 		cb(e, null);
 	}
