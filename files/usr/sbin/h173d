@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.5.8';
+const VERSION = '0.5.9';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -876,6 +876,15 @@ conn = ubus.connect();
 if (!conn) {
 	warn('h173d: cannot connect to ubus\n');
 	exit(1);
+}
+
+// uhttpd-mod-ubus her kimlik doğrulamalı /ubus çağrısına 'ubus_rpc_session' alanını ekler;
+// ucode yayınlanan nesnelerde politikada OLMAYAN her argümanı reddeder (INVALID_ARGUMENT).
+// Bu yüzden her metodun arg politikasına ubus_rpc_session (string) eklenir — aksi halde
+// panelden gelen tüm çağrılar 'geçersiz argüman' ile düşer (ubus CLI oturum eklemediği için çalışır).
+for (let _name, _m in methods) {
+	if (!_m.args) _m.args = {};
+	_m.args.ubus_rpc_session = '';
 }
 
 if (!conn.publish('h173', methods)) {

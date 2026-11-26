@@ -221,6 +221,14 @@ Kaldırmadan sonra tarayıcıyı **Ctrl+Shift+R** ile yenileyin.
 - Değilse: `uci set uhttpd.main.ubus_prefix='/ubus'; uci commit uhttpd; /etc/init.d/uhttpd restart`
 - `rpcd`'yi yenileyin: `/etc/init.d/rpcd restart`
 
+**"geçersiz argüman" (ör. `h173.status: geçersiz argüman`)**
+- `h173d` sürüm **0.5.9 ve üstünde** çözüldü. Daha eskiyse daemon'ı güncelleyin.
+- Nedeni: `uhttpd-mod-ubus` her oturumlu `/ubus` çağrısına `ubus_rpc_session` alanını
+  ekler; ucode ile yayınlanan nesneler politikada olmayan argümanı reddeder, bu yüzden
+  panelden gelen çağrılar düşerken `ubus call h173 status` (oturum eklemez) çalışır.
+  0.5.9 her metodun arg politikasına `ubus_rpc_session`'ı ekler.
+- Sürümü kontrol: `ubus call h173 status | grep version` ya da `h173d` başındaki `VERSION`.
+
 **"metod yok" / "bulunamadı (h173d çalışıyor mu?)"**
 - Daemon çalışıyor mu?  `/etc/init.d/h173 status` ve `ubus list | grep h173`
   (`h173` görünmeli).
