@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.6.4';
+const VERSION = '0.6.5';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -675,6 +675,9 @@ function sms_send(req, to, text) {
 	if (!length(text ?? ''))
 		return reply_err(req, 'empty message');
 	let mode = text_mode(text);
+	// Denetlenebilir iz: her GERÇEK gönderim burada loglanır. Panel kendiliğinden
+	// SMS göndermez; logread'de kayıt yoksa gönderim panelden çıkmamıştır.
+	warn(sprintf('h173d: sms_send -> %s (%d karakter)\n', join(',', phones), utf16_len(text)));
 
 	let tlen = utf16_len(text);              // UZUNLUK ham metnin karakter sayısıdır;
 	                                         // kaçışlı (escaped) içeriğin değil — yoksa
@@ -766,6 +769,28 @@ const methods = {
 				(k) => sess.post_enc('/api/sms/set-read', body, 2, (e, v) => k(e, e ? null : v)),
 				(k) => sess.post('/api/sms/set-read', body, (e, v) => k(e, e ? null : v)),
 				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, result: r }));
+		}
+	},
+
+	// Giden kutusunu (BoxType 2) listele ve tüm mesajları sil. Modemde takılı kalan
+	// giden SMS, tekrar tekrar gönderilip "hatalı mesaj" cevaplarına yol açabiliyor.
+	sms_clear_outbox: {
+		args: {},
+		call: (req) => {
+			req.defer();
+			classic_box(2, (e, msgs) => {
+				if (e)
+					return reply_err(req, e);
+				let ids = filter(map(msgs ?? [], (m) => m.index), (x) => x != null && match('' + x, /^[0-9]+$/));
+				if (!length(ids))
+					return req.reply({ ok: true, deleted: 0 });
+				warn(sprintf('h173d: sms_clear_outbox -> %d giden mesaj siliniyor: %s\n', length(ids), join(',', ids)));
+				let body = { Index: length(ids) == 1 ? ids[0] : ids };
+				sms_dispatch('delete',
+					(k) => sess.post_enc('/api/sms/delete-sms', body, 2, (e2, v) => k(e2, e2 ? null : v)),
+					(k) => sess.post('/api/sms/delete-sms', body, (e2, v) => k(e2, e2 ? null : v)),
+					(e2, v) => e2 ? reply_err(req, e2) : req.reply({ ok: true, deleted: length(ids) }));
+			});
 		}
 	},
 
