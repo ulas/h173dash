@@ -1,0 +1,5 @@
+#!/bin/sh
+# make sure the config is only readable by root (it holds the modem password)
+chmod 600 /etc/config/h173 2>/dev/null
+/etc/init.d/h173 enable
+exit 0

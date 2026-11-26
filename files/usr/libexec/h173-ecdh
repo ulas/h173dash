@@ -1,0 +1,19 @@
+#!/usr/bin/ucode
+// h173-ecdh <server_pub_hex> <outfile>
+// Generates an elliptic.js-compatible curve25519 key pair against the modem's public key
+// and writes {"pub":..,"key":..} (hex) to <outfile>. Runs as a child of h173d so the
+// slow pure-ucode scalar multiplications never block the daemon's event loop.
+'use strict';
+import * as X from 'h173.crypto';
+import * as P from 'h173.proto';
+import { writefile, rename } from 'fs';
+
+let server = ARGV[0], out = ARGV[1];
+if (!match(server ?? '', /^[0-9a-fA-F]{1,64}$/) || !out)
+	exit(2);
+let kp = X.ecdh_new(lc(server));
+if (!kp)
+	exit(1);
+writefile(out + '.tmp', sprintf('%J', { pub: kp.pub, key: P.bin2hex(kp.key) }));
+rename(out + '.tmp', out);
+exit(0);

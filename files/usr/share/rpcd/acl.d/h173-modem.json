@@ -1,0 +1,31 @@
+{
+	"h173-modem": {
+		"description": "H173-386 5G modem daemon (h173d) ubus erişimi",
+		"read": {
+			"ubus": {
+				"h173": [
+					"status",
+					"history",
+					"scan_result",
+					"config_get",
+					"sms_contacts",
+					"sms_thread",
+					"band_info"
+				]
+			}
+		},
+		"write": {
+			"ubus": {
+				"h173": [
+					"action",
+					"scan_start",
+					"raw",
+					"config_set",
+					"sms_send",
+					"sms_delete",
+					"sms_read"
+				]
+			}
+		}
+	}
+}

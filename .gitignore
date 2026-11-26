@@ -1,0 +1,4 @@
+dist-pkg/
+*.apk
+*.ipk
+.DS_Store

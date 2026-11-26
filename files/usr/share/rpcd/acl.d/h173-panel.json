@@ -1,0 +1,48 @@
+{
+	"h173-panel": {
+		"description": "H173 Panel: LuCI'siz tam router yönetimi (uci/ubus)",
+		"read": {
+			"ubus": {
+				"system": [ "board", "info" ],
+				"network.interface": [ "dump" ],
+				"network.device": [ "status" ],
+				"network.wireless": [ "status" ],
+				"iwinfo": [ "assoclist", "info", "devices", "scan" ],
+				"luci-rpc": [
+					"getDHCPLeases",
+					"getHostHints",
+					"getNetworkDevices",
+					"getWirelessDevices",
+					"getBoardJSON"
+				],
+				"uci": [ "get", "state", "changes", "configs" ]
+			},
+			"uci": [ "*" ]
+		},
+		"write": {
+			"ubus": {
+				"uci": [
+					"add", "set", "delete", "order", "rename",
+					"commit", "revert", "apply", "confirm", "rollback"
+				],
+				"network": [ "reload", "restart" ],
+				"network.wireless": [ "reload" ],
+				"system": [ "reboot" ],
+				"file": {
+					"logread": [ "exec" ],
+					"/sbin/logread": [ "exec" ],
+					"dmesg": [ "exec" ],
+					"/bin/dmesg": [ "exec" ],
+					"ping": [ "exec" ],
+					"/bin/ping": [ "exec" ],
+					"traceroute": [ "exec" ],
+					"/bin/traceroute": [ "exec" ],
+					"nslookup": [ "exec" ],
+					"/usr/bin/nslookup": [ "exec" ],
+					"/bin/sh": [ "exec" ]
+				}
+			},
+			"uci": [ "*" ]
+		}
+	}
+}

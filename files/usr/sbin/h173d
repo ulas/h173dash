@@ -1,0 +1,884 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: MIT
+// h173d - polls a Brovi/Zowee H173-386 5G CPE and publishes ubus object "h173"
+//
+//   ubus call h173 status
+//   ubus call h173 history '{"since":0}'
+//   ubus call h173 action '{"cmd":"reconnect"}'
+//
+// Config: /etc/config/h173 (section 'main'). Everything is kept in RAM.
+
+'use strict';
+
+import * as uloop from 'uloop';
+import * as ubus from 'ubus';
+import * as fs from 'fs';
+import * as P from 'h173.proto';
+import * as C from 'h173.client';
+
+let uci = null;
+try { uci = require('uci'); } catch (e) { uci = null; }
+
+const VERSION = '0.5.7';
+
+/* ------------------------------------------------------------------ */
+/* configuration                                                       */
+/* ------------------------------------------------------------------ */
+
+let sms_mode_used = null;   // 'ecc' | 'classic' once an SMS call succeeded
+
+function load_config() {
+	let c = {
+		enabled: true,
+		host: '192.168.8.1',
+		username: 'vodafone',
+		password: '',
+		interval: 5,
+		history: 720,
+		show_ids: false,
+		login_backoff: 300,
+		transport: 'auto',
+		sms_mode: 'auto'
+	};
+
+	if (uci) {
+		let cur = uci.cursor();
+		let s = cur.get_all('h173', 'main');
+		if (s) {
+			c.enabled = (s.enabled ?? '1') != '0';
+			c.host = s.host ?? c.host;
+			c.username = s.username ?? c.username;
+			c.password = s.password ?? '';
+			c.interval = max(2, +(s.interval ?? 5));
+			c.history = max(60, min(5000, +(s.history ?? 720)));
+			c.show_ids = (s.show_ids ?? '0') == '1';
+			c.login_backoff = max(30, +(s.login_backoff ?? 300));
+			c.transport = s.transport ?? 'auto';
+			c.sms_mode = s.sms_mode ?? 'auto';
+		}
+	}
+
+	// test/dev overrides (never used on the router unless set explicitly)
+	let env = getenv();
+	if (env.H173_HOST) c.host = env.H173_HOST;
+	if (env.H173_USER) c.username = env.H173_USER;
+	if (env.H173_PASS) c.password = env.H173_PASS;
+	if (env.H173_INTERVAL) c.interval = max(1, +env.H173_INTERVAL);
+	if (env.H173_TRANSPORT) c.transport = env.H173_TRANSPORT;
+	if (env.H173_SMS_MODE) c.sms_mode = env.H173_SMS_MODE;
+
+	return c;
+}
+
+let ecdh_seconds = null;
+
+// ECDH key pairs are computed by /usr/libexec/h173-ecdh in a child process
+// (pure-ucode curve25519 takes a few seconds on the router's CPU).
+function ecdh_child(server_pub, cb) {
+	let dir = '/tmp/h173';
+	fs.mkdir(dir);
+	let out = sprintf('%s/ecdh-%d-%d.json', dir, time(), int(clock()[1] / 1000));
+	let me = sourcepath() ?? '/usr/sbin/h173d';
+	let helper = replace(me, /sbin\/h173d$/, 'libexec/h173-ecdh');
+	let ucode = fs.access('/usr/bin/ucode') ? '/usr/bin/ucode' : '/usr/local/bin/ucode';
+	let args = [];
+	for (let l in split(getenv('H173_LIBPATH') ?? '', ':'))     // test setups only
+		if (length(l)) push(args, '-L', l);
+	push(args, '-S', helper, server_pub, out);
+	let started = time();
+	let proc = uloop.process(ucode, args, null, (code) => {
+		let j = null;
+		try { j = json(fs.readfile(out) ?? 'null'); } catch (e) { j = null; }
+		fs.unlink(out);
+		if (code != 0 || !j?.key)
+			return cb(`ecdh helper failed (exit ${code})`, null);
+		ecdh_seconds = time() - started;
+		cb(null, { pub: j.pub, key: P.hex2bin(j.key) });
+	});
+	if (!proc)
+		cb('cannot start ecdh helper', null);
+}
+let cfg = load_config();
+cfg.ecdh = ecdh_child;
+let sess = C.session(cfg);
+
+/* ------------------------------------------------------------------ */
+/* state                                                               */
+/* ------------------------------------------------------------------ */
+
+let cache = {}, stamp = {}, errors = {}, unsupported = {};
+let history = [];
+let tick = 0, polling = false, started = time();
+let scan = { state: 'idle', started: 0, finished: 0, result: null, error: null };
+let last_netdev = null;
+
+// what we poll and how often (in ticks of cfg.interval)
+const POLLS = [
+	// key,          path,                                  every, opts
+	[ 'signal',      '/api/device/signal',                   1 ],
+	[ 'monitor',     '/api/monitoring/status',               1, { headers: { 'Update-Cookie': 'UpdateCookie' } } ],
+	[ 'traffic',     '/api/monitoring/traffic-statistics',   1 ],
+	[ 'plmn',        '/api/net/current-plmn',                3 ],
+	[ 'cells',       '/api/net/cell-info',                   3 ],
+	[ 'nbr',         '/api/device/nbrcellinfo',              3 ],
+	[ 'seccell',     '/api/device/seccellinfo',              3 ],
+	[ 'netmode',     '/api/net/net-mode',                   12 ],
+	[ 'dataswitch',  '/api/dialup/mobile-dataswitch',       12 ],
+	[ 'month',       '/api/monitoring/month_statistics',    12 ],
+	[ 'notify',      '/api/monitoring/check-notifications', 12 ],
+	[ 'smscount',    '/api/sms/sms-count',                  12 ],
+	[ 'device',      '/api/device/information',             60 ],
+	[ 'sim',         '/api/sim/sim-info',                   60 ],
+	[ 'pin',         '/api/pin/status',                     60 ],
+	[ 'netmodelist', '/api/net/net-mode-list',             360 ],
+	[ 'bridge',      '/api/security/bridgemode',            60 ],
+	// --- extras confirmed open on the real device (read-only, operator not gated) ---
+	[ 'boot',        '/api/device/boot_time',               60 ],   // uptime / last boot
+	[ 'cradle',      '/api/cradle/status-info',             12 ],   // ethernet (HX21) link
+	[ 'cradleinfo',  '/api/cradle/basic-info',             360 ],
+	[ 'antenna',     '/api/device/antenna_type',            60 ],   // internal/external antenna
+	[ 'apn',         '/api/dialup/profiles',               360 ],   // APN profile(s)
+	[ 'csps',        '/api/net/csps_state',                 12 ],   // CS/PS registration
+	[ 'update',      '/api/online-update/status',          360 ]    // firmware update status
+];
+
+const SENSITIVE = [ 'Imei', 'Imsi', 'Iccid', 'Msisdn', 'SerialNumber', 'imei', 'imsi', 'iccid', 'msisdn', 'MacAddress1', 'MacAddress2' ];
+
+function mask(v) {
+	if (cfg.show_ids || type(v) != 'object')
+		return v;
+	let o = {};
+	for (let k, x in v) {
+		if ((k in SENSITIVE) && type(x) == 'string' && length(x) > 4)
+			o[k] = substr(x, 0, 3) + '…' + substr(x, -3);
+		else
+			o[k] = x;
+	}
+	return o;
+}
+
+function num(v) {
+	if (v == null || v == '')
+		return null;
+	let s = match('' + v, /-?[0-9]+(\.[0-9]+)?/);
+	return s ? +s[0] : null;
+}
+
+/* ------------------------------------------------------------------ */
+/* router side (cheap, local)                                          */
+/* ------------------------------------------------------------------ */
+
+let conn = null;
+
+function netdev() {
+	let out = {};
+	let f = fs.open('/proc/net/dev', 'r');
+	if (!f)
+		return out;
+	let line;
+	while ((line = f.read('line')) != null && length(line)) {
+		let m = match(line, /^\s*([^:\s]+):\s*(.*)$/);
+		if (!m)
+			continue;
+		let n = split(trim(m[2]), /\s+/);
+		out[m[1]] = { rx: +n[0], tx: +n[8] };
+	}
+	f.close();
+	return out;
+}
+
+function wan_device() {
+	let st = conn?.call('network.interface.wan', 'status', {});
+	return st?.l3_device ?? st?.device ?? null;
+}
+
+function router_sample() {
+	let now = clock(true);   // [sec, nsec] monotonic
+	let t = now[0] + now[1] / 1e9;
+	let nd = netdev();
+	let dev = wan_device();
+	if (!dev || !nd[dev])
+		for (let k in keys(nd))
+			if (k != 'lo') { dev = k; break; }
+
+	let rate = { dev, rx_bps: null, tx_bps: null };
+	if (last_netdev && dev && nd[dev] && last_netdev.nd[dev] && t > last_netdev.t) {
+		let dt = t - last_netdev.t;
+		rate.rx_bps = int(max(0, nd[dev].rx - last_netdev.nd[dev].rx) * 8 / dt);
+		rate.tx_bps = int(max(0, nd[dev].tx - last_netdev.nd[dev].tx) * 8 / dt);
+	}
+	last_netdev = { t, nd };
+	return rate;
+}
+
+function router_info() {
+	let temp = null;
+	let tz = fs.readfile('/sys/class/thermal/thermal_zone0/temp');
+	if (tz)
+		temp = +trim(tz) / 1000;
+	let ct = fs.readfile('/proc/sys/net/netfilter/nf_conntrack_count');
+	let ctmax = fs.readfile('/proc/sys/net/netfilter/nf_conntrack_max');
+	return {
+		temperature: temp,
+		conntrack: ct ? +trim(ct) : null,
+		conntrack_max: ctmax ? +trim(ctmax) : null,
+		netdev: netdev()
+	};
+}
+
+/* ------------------------------------------------------------------ */
+/* polling                                                             */
+/* ------------------------------------------------------------------ */
+
+function store(key, e, v) {
+	if (e) {
+		errors[key] = e;
+		let code = (type(e) == 'object') ? e.code : '';
+		if (code == '100002' || code == 'http404')
+			unsupported[key] = true;
+		return;
+	}
+	cache[key] = (key == 'device' || key == 'sim') ? mask(v) : v;
+	stamp[key] = time();
+	delete errors[key];
+}
+
+// some firmwares (H173 C919) report CurrentDownloadRate/UploadRate as 0 all the time:
+// fall back to the byte counters' delta between two traffic samples
+let rate_prev = null;
+function modem_rates(tr) {
+	let now = stamp.traffic ?? time(), dl = num(tr.CurrentDownload), ul = num(tr.CurrentUpload);
+	let rdl = num(tr.CurrentDownloadRate), rul = num(tr.CurrentUploadRate);
+	let out = { dl: rdl != null ? rdl * 8 : null, ul: rul != null ? rul * 8 : null };
+	if (rate_prev && dl != null && ul != null && now > rate_prev.t && dl >= rate_prev.dl && ul >= rate_prev.ul) {
+		let dt = now - rate_prev.t;
+		if (!rdl) out.dl = (dl - rate_prev.dl) * 8 / dt;
+		if (!rul) out.ul = (ul - rate_prev.ul) * 8 / dt;
+	}
+	if (dl != null && ul != null && (!rate_prev || now != rate_prev.t))
+		rate_prev = { t: now, dl, ul };
+	else if (rate_prev && now == rate_prev.t)
+		return rate_prev.last ?? out;
+	if (rate_prev) rate_prev.last = out;
+	return out;
+}
+
+function record_history(rr) {
+	let s = cache.signal ?? {}, tr = cache.traffic ?? {};
+	let mr = modem_rates(tr);
+	push(history, {
+		t: time(),
+		rsrp: num(s.rsrp), rsrq: num(s.rsrq), sinr: num(s.sinr), rssi: num(s.rssi),
+		nrrsrp: num(s.nrrsrp), nrrsrq: num(s.nrrsrq), nrsinr: num(s.nrsinr),
+		// modem-reported rates are bytes/s
+		m_dl: mr.dl,
+		m_ul: mr.ul,
+		// router WAN rates in bit/s
+		r_dl: rr.rx_bps, r_ul: rr.tx_bps
+	});
+	while (length(history) > cfg.history)
+		shift(history);
+}
+
+let poll_started = 0, link_error = null;
+function poll(force_all) {
+	// a stuck cycle (should not happen) must never stop polling for good
+	if (polling && time() - poll_started > 60) {
+		warn('h173d: poll cycle stuck, resetting\n');
+		polling = false;
+	}
+	if (polling || !cfg.enabled)
+		return;
+	polling = true;
+	let list = filter(POLLS, (p) => !unsupported[p[0]] && (force_all || (tick % p[2]) == 0));
+	tick++;
+	let i = 0;
+	poll_started = time();
+	function next() {
+		if (i >= length(list)) {
+			try { record_history(router_sample()); }
+			catch (ex) { warn('h173d: history: ' + ex + '\n'); }
+			polling = false;
+			return;
+		}
+		let p = list[i++];
+		sess.get(p[1], (e, v) => {
+			try { store(p[0], e, v); }
+			catch (ex) { warn('h173d: store ' + p[0] + ': ' + ex + '\n'); }
+			// transport errors (modem unreachable): don't block on the rest of the cycle
+			if (type(e) == 'string') {
+				link_error = e;
+				i = length(list);
+			}
+			else
+				link_error = null;
+			next();
+		}, p[3]);
+	}
+	next();
+}
+
+let poll_timer = null;
+function schedule() {
+	poll_timer?.cancel();
+	let ms = cfg.interval * 1000;
+	// self re-arming timer (uloop.interval() is not available on every ucode build)
+	poll_timer = uloop.timer(ms, () => {
+		poll(false);
+		poll_timer.set(ms);
+	});
+}
+
+/* ------------------------------------------------------------------ */
+/* actions                                                             */
+/* ------------------------------------------------------------------ */
+
+function reply_err(req, e) {
+	if (type(e) == 'object')
+		return req.reply({ ok: false, code: e.code, error: e.text });
+	req.reply({ ok: false, error: '' + e });
+}
+
+// read current net-mode, change some fields, write back everything else untouched
+function netmode_update(req, changes) {
+	sess.get('/api/net/net-mode', (e, cur) => {
+		if (e)
+			return reply_err(req, e);
+		if (type(cur) != 'object')
+			return reply_err(req, 'unexpected net-mode reply');
+		let body = {};
+		for (let k, v in cur)
+			body[k] = v;
+		for (let k, v in changes)
+			body[k] = v;
+		sess.post('/api/net/net-mode', body, (e2, v2) => {
+			if (e2)
+				return reply_err(req, e2);
+			cache.netmode = body;
+			stamp.netmode = time();
+			req.reply({ ok: true, result: v2, sent: body });
+		});
+	});
+}
+
+function parse_bands(s) {
+	s = trim('' + (s ?? ''));
+	if (s == '' || uc(s) == 'AUTO' || uc(s) == 'ALL')
+		return null;
+	let out = [];
+	for (let b in split(s, /[ ,;+]+/)) {
+		b = +replace(b, /[^0-9]/g, '');
+		if (b >= 1 && b <= 63)
+			push(out, b);
+	}
+	return out;
+}
+
+const ACTIONS = {
+	data_on:  (req, a) => sess.post('/api/dialup/mobile-dataswitch', { dataswitch: 1 }, (e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v })),
+	data_off: (req, a) => sess.post('/api/dialup/mobile-dataswitch', { dataswitch: 0 }, (e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v })),
+
+	reconnect: (req, a) => sess.post('/api/dialup/mobile-dataswitch', { dataswitch: 0 }, (e) => {
+		if (e)
+			return reply_err(req, e);
+		uloop.timer(2500, () => sess.post('/api/dialup/mobile-dataswitch', { dataswitch: 1 },
+			(e2, v2) => e2 ? reply_err(req, e2) : req.reply({ ok: true, result: v2 })));
+	}),
+
+	reboot: (req, a) => sess.post('/api/device/control', { Control: 1 }, (e, v) => {
+		if (e)
+			return reply_err(req, e);
+		sess.reset();
+		req.reply({ ok: true, result: v });
+	}),
+
+	clear_traffic: (req, a) => sess.post('/api/monitoring/clear-traffic', { ClearTraffic: 1 }, (e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v })),
+
+	// value: raw NetworkMode code as reported by the device ("00" auto, "03" LTE only, ...)
+	netmode: (req, a) => {
+		let m = trim('' + (a.value ?? ''));
+		if (!match(m, /^[0-9]{2,8}$/))
+			return reply_err(req, 'netmode value must be a numeric mode code, e.g. 00');
+		netmode_update(req, { NetworkMode: m });
+	},
+
+	// value: "1,3,7,20" or "AUTO"; 5G (NR*) fields are left as they are
+	lte_bands: (req, a) => {
+		let b = parse_bands(a.value);
+		netmode_update(req, { LTEBand: b ? P.lte_bands_to_mask(b) : P.LTE_ALL });
+	},
+
+	// 5G access mode via net-mode "networkOption": 0=NSA, 1=SA, 2=SA+NSA (auto).
+	// mapping confirmed from the device's /config/global/net-type.xml rule "SA+NSA;NSA;SA"=2;0;1.
+	nr_mode: (req, a) => {
+		let m = trim('' + (a.value ?? ''));
+		if (!(m in [ '0', '1', '2' ]))
+			return reply_err(req, 'nr_mode value must be 0 (NSA), 1 (SA) or 2 (SA+NSA)');
+		netmode_update(req, { networkOption: m });
+	},
+
+	// value: "" or "auto" -> automatic; otherwise PLMN like 28603. extra: rat code (optional)
+	register: (req, a) => {
+		let v = trim('' + (a.value ?? ''));
+		let body = (v == '' || lc(v) == 'auto')
+			? { Mode: 0, Plmn: '', Rat: '' }
+			: { Mode: 1, Plmn: v, Rat: '' + (a.extra ?? '') };
+		sess.post('/api/net/register', body, (e, r) => e ? reply_err(req, e) : req.reply({ ok: true, result: r }));
+	},
+
+	login: (req, a) => sess.login((e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v })),
+
+	refresh: (req, a) => { poll(true); req.reply({ ok: true }); }
+};
+
+function apply_config() {
+	cfg = load_config();
+	cfg.ecdh = ecdh_child;
+	sess = C.session(cfg);
+	unsupported = {};
+	errors = {};
+	schedule();
+	poll(true);
+}
+
+/* ------------------------------------------------------------------ */
+/* ubus                                                                */
+/* ------------------------------------------------------------------ */
+
+function snapshot() {
+	return {
+		version: VERSION,
+		uptime: time() - started,
+		config: {
+			enabled: cfg.enabled, host: cfg.host, username: cfg.username,
+			has_password: length(cfg.password) > 0, interval: cfg.interval,
+			history: cfg.history, show_ids: cfg.show_ids, transport: cfg.transport, sms_mode: cfg.sms_mode
+		},
+		session: sess.state(),
+		link_error,
+		data: cache,
+		updated: stamp,
+		errors: errors,
+		unsupported: keys(unsupported),
+		derived: {
+			lte_bands_allowed: P.lte_mask_to_bands(cache.netmode?.LTEBand),
+			sample: length(history) ? history[length(history) - 1] : null
+		},
+		router: router_info(),
+		ecdh_seconds,
+		sms_mode: { config: cfg.sms_mode, used: sms_mode_used },
+		scan: { state: scan.state, started: scan.started, finished: scan.finished, error: scan.error }
+	};
+}
+
+/* ------------------------------------------------------------------ */
+/* SMS (encrypted endpoints)                                           */
+/* ------------------------------------------------------------------ */
+
+// the web UI's xss(): HTML-escapes & ' " < > / ( ) before the text goes into the XML
+function ui_escape(s) {
+	return replace('' + s, /[&'"<>\/()]/g, (c) => ({
+		'&': '&amp;', "'": '&#39;', '"': '&quot;', '<': '&lt;', '>': '&gt;',
+		'/': '&#x2F;', '(': '&#40;', ')': '&#41;'
+	})[c]);
+}
+
+// JavaScript String.length of a UTF-8 string (UTF-16 code units)
+function utf16_len(s) {
+	let n = 0;
+	for (let i = 0; i < length(s); i++) {
+		let c = ord(s, i);
+		if ((c & 0xc0) == 0x80)
+			continue;          // continuation byte
+		n += (c >= 0xf0) ? 2 : 1;
+	}
+	return n;
+}
+
+// 1 = GSM 7-bit, 0 = UCS2 (as in the web UI); 7-bit only for plain ASCII text
+function text_mode(s) {
+	for (let i = 0; i < length(s); i++) {
+		let c = ord(s, i);
+		if (c >= 0x80 || c == 0x60 || (c < 0x20 && c != 10 && c != 13))
+			return 0;
+	}
+	return 1;
+}
+
+function now_str() {
+	let t = localtime();
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', t.year, t.mon, t.mday, t.hour, t.min, t.sec);
+}
+
+function as_list(v) {
+	if (v == null || v == '')
+		return [];
+	return (type(v) == 'array') ? v : [ v ];
+}
+
+function sms_messages(v) {
+	return {
+		count: +(v?.Count ?? 0),
+		messages: as_list(v?.messages?.message ?? v?.Messages?.Message)
+	};
+}
+
+function phone_list(s) {
+	let out = [];
+	for (let p in split('' + (s ?? ''), /[ ,;]+/))
+		if (match(p, /^\+?[0-9*#]{2,20}$/))
+			push(out, p);
+	return out;
+}
+
+/* Two ways to reach the SMS store:
+ *  ecc     - what the device's web UI does: encrypted endpoints sms-list-contact/-phone
+ *  classic - what the Huawei AI Life app does: plain /api/sms/sms-list (BoxType 1 inbox, 2 outbox)
+ * sms_mode 'auto' tries ecc first and falls back to classic when the device refuses it. */
+const SMS_FALLBACK = { nokey: 1, rsa: 1, ecdh: 1, decrypt: 1, '100002': 1, '100005': 1, '100006': 1, http404: 1, http400: 1 };
+
+function sms_dispatch(name, ecc_fn, classic_fn, done) {
+	let mode = cfg.sms_mode ?? 'auto';
+	if (mode == 'classic' || (mode == 'auto' && sms_mode_used == 'classic'))
+		return classic_fn((e, v) => { if (!e) sms_mode_used = 'classic'; done(e, v); });
+	ecc_fn((e, v) => {
+		let code = (type(e) == 'object') ? e.code : null;
+		if (!e) {
+			sms_mode_used = 'ecc';
+			return done(null, v);
+		}
+		if (mode == 'auto' && code && SMS_FALLBACK[code])
+			return classic_fn((e2, v2) => {
+				if (!e2)
+					sms_mode_used = 'classic';
+				done(e2 ? e : null, v2);    // report the ecc error if both fail
+			});
+		done(e, v);
+	});
+}
+
+function classic_norm(m) {
+	return { index: m.Index, phone: m.Phone, content: m.Content, date: m.Date, smstat: m.Smstat, smstype: m.SmsType };
+}
+
+function classic_box(box, cb) {
+	sess.post('/api/sms/sms-list', { PageIndex: 1, ReadCount: 50, BoxType: box, SortType: 0, Ascending: 0, UnreadPreferred: 0 },
+		(e, v) => e ? cb(e, null) : cb(null, map(as_list(v?.Messages?.Message ?? v?.messages?.message), classic_norm)));
+}
+
+function classic_all(cb) {
+	classic_box(1, (e, inbox) => {
+		if (e)
+			return cb(e, null);
+		classic_box(2, (e2, outbox) => cb(null, [ ...inbox, ...(e2 ? [] : outbox) ]));
+	});
+}
+
+function classic_contacts(cb) {
+	classic_all((e, all) => {
+		if (e)
+			return cb(e, null);
+		let by = {}, unread = {};
+		for (let m in all) {
+			if (m.smstat == '0')
+				unread[m.phone] = (unread[m.phone] ?? 0) + 1;
+			if (!by[m.phone] || m.date > by[m.phone].date)
+				by[m.phone] = m;
+		}
+		let list = sort(values(by), (x, y) => (x.date > y.date) ? -1 : (x.date < y.date) ? 1 : 0);
+		for (let m in list)
+			m.unreadcount = '' + (unread[m.phone] ?? 0);
+		cb(null, { count: length(list), messages: list });
+	});
+}
+
+function classic_thread(phone, cb) {
+	classic_all((e, all) => {
+		if (e)
+			return cb(e, null);
+		let list = sort(filter(all, (m) => m.phone == phone), (x, y) => (x.date < y.date) ? -1 : (x.date > y.date) ? 1 : 0);
+		cb(null, { count: length(list), messages: list });
+	});
+}
+
+function send_xml(phones, content, len, mode, extra) {
+	return '<?xml version="1.0" encoding="UTF-8"?><request><Index>-1</Index><Phones>' +
+		join('', map(phones, (p) => `<Phone>${p}</Phone>`)) +
+		`</Phones><Sca></Sca><Content>${content}</Content><Length>${len}</Length>` +
+		`<Reserved>${mode}</Reserved><Date>${now_str()}</Date>${extra ?? ''}</request>`;
+}
+
+// polls send-status (every 3 s, ~24 s max) like the web UI and the app
+function sms_wait(status_fn, req) {
+	let tries = 0;
+	function check() {
+		status_fn((e2, st) => {
+			tries++;
+			let pending = (type(st) == 'object' && length(st.Phone ?? ''));
+			if (!e2 && type(st) == 'object' && !pending)
+				return req.reply({ ok: length(st.FailPhone ?? '') == 0, sent: st.SucPhone ?? '', failed: st.FailPhone ?? '', code: st.SendFailCode ?? '', mode: sms_mode_used });
+			if (tries >= 8)
+				return req.reply({ ok: true, pending: true, note: 'still sending; check the thread', mode: sms_mode_used, error: e2 ? (e2.text ?? e2) : null });
+			uloop.timer(3000, check);
+		});
+	}
+	uloop.timer(1500, check);
+}
+
+function sms_send(req, to, text) {
+	let phones = phone_list(to);
+	if (!length(phones))
+		return reply_err(req, 'no valid phone number');
+	if (!length(text ?? ''))
+		return reply_err(req, 'empty message');
+	let mode = text_mode(text);
+
+	let ecc_send = (k) => {
+		let content = ui_escape(text);       // web UI: xss() then raw into the XML
+		sess.post_enc('/api/sms/send-sms', send_xml(phones, content, utf16_len(content), mode), 2, (e, v) => k(e, e ? null : 'ecc'), { timeout: 30000 });
+	};
+	let classic_send = (k) => {
+		// app: plain XML, normal XML escaping, SendType 0
+		sess.post('/api/sms/send-sms', send_xml(phones, P.xml_escape(text), utf16_len(text), mode, '<SendType>0</SendType>'),
+			(e, v) => k(e, e ? null : 'classic'), { timeout: 30000 });
+	};
+
+	sms_dispatch('send', ecc_send, classic_send, (e, used) => {
+		if (e)
+			return reply_err(req, e);
+		sms_wait((cb) => (used == 'classic')
+			? sess.get('/api/sms/send-status', cb)
+			: sess.post_enc('/api/sms/send-status', {}, 1, cb), req);
+	});
+}
+
+const methods = {
+	sms_contacts: {
+		args: { page: 0, count: 0 },
+		call: (req) => {
+			req.defer();
+			let body = { pageindex: max(1, +(req.args.page ?? 1)), readcount: min(50, max(1, +(req.args.count ?? 20))) };
+			sms_dispatch('contacts',
+				(k) => sess.post_enc('/api/sms/sms-list-contact', body, 1, (e, v) => k(e, e ? null : sms_messages(v))),
+				classic_contacts,
+				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, mode: sms_mode_used, ...r }));
+		}
+	},
+
+	sms_thread: {
+		args: { phone: '', page: 0, count: 0 },
+		call: (req) => {
+			let phone = '' + (req.args.phone ?? '');
+			if (!length(phone))
+				return { ok: false, error: 'phone required' };
+			req.defer();
+			let body = { phone, pageindex: max(1, +(req.args.page ?? 1)), readcount: min(50, max(1, +(req.args.count ?? 20))) };
+			sms_dispatch('thread',
+				(k) => sess.post_enc('/api/sms/sms-list-phone', body, 3, (e, v) => k(e, e ? null : sms_messages(v))),
+				(k) => classic_thread(phone, k),
+				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, mode: sms_mode_used, ...r }));
+		}
+	},
+
+	sms_send: {
+		args: { to: '', text: '' },
+		call: (req) => {
+			req.defer();
+			sms_send(req, req.args.to, req.args.text);
+		}
+	},
+
+	// ids: "40001,40002"
+	sms_delete: {
+		args: { ids: '' },
+		call: (req) => {
+			let ids = filter(split('' + (req.args.ids ?? ''), /[ ,;]+/), (x) => match(x, /^[0-9]+$/));
+			if (!length(ids))
+				return { ok: false, error: 'ids required' };
+			req.defer();
+			sess.post('/api/sms/delete-sms', { Index: length(ids) == 1 ? ids[0] : ids },
+				(e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v }));
+		}
+	},
+
+	sms_read: {
+		args: { ids: '' },
+		call: (req) => {
+			let ids = filter(split('' + (req.args.ids ?? ''), /[ ,;]+/), (x) => match(x, /^[0-9]+$/));
+			if (!length(ids))
+				return { ok: false, error: 'ids required' };
+			req.defer();
+			sess.post('/api/sms/set-read', { Index: ids },
+				(e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v }));
+		}
+	},
+
+	status: {
+		call: (req) => snapshot()
+	},
+
+	history: {
+		args: { since: 0 },
+		call: (req) => {
+			let since = +(req.args.since ?? 0);
+			return { samples: filter(history, (h) => h.t > since), interval: cfg.interval };
+		}
+	},
+
+	action: {
+		args: { cmd: '', value: '', extra: '' },
+		call: (req) => {
+			let fn = ACTIONS[req.args.cmd ?? ''];
+			if (!fn)
+				return { ok: false, error: 'unknown cmd', cmds: keys(ACTIONS) };
+			req.defer();
+			fn(req, req.args);
+		}
+	},
+
+	scan_start: {
+		call: (req) => {
+			if (scan.state == 'running')
+				return { ok: false, error: 'scan already running', started: scan.started };
+			scan = { state: 'running', started: time(), finished: 0, result: null, error: null };
+			sess.get('/api/net/plmn-list', (e, v) => {
+				scan.finished = time();
+				if (e) {
+					scan.state = 'error';
+					scan.error = (type(e) == 'object') ? e.text : e;
+					return;
+				}
+				scan.state = 'done';
+				let nets = v?.Networks?.Network ?? [];
+				scan.result = (type(nets) == 'array') ? nets : [ nets ];
+			}, { timeout: 150000 });
+			return { ok: true, started: scan.started };
+		}
+	},
+
+	scan_result: {
+		call: (req) => scan
+	},
+
+	// Developer-mode band info (read-only): supported LTE bands + current lock-freq state.
+	// Uses a temporary developer-mode session; the poller re-logs in normally afterwards.
+	band_info: {
+		call: (req) => {
+			req.defer();
+			sess.dev_op((api, done) => {
+				api.get('/api/net/lte-band-info', (e, bi) => {
+					api.get('/api/net/lock-freq', (e2, lf) => {
+						// bandfreqlist.xml = authoritative supported LTE/NR bands + which NR bands allow cell lock
+						api.get('/config/network/bandfreqlist.xml', (e3, bf) => {
+							done(null, { band_info: e ? { error: '' + (e.text ?? e) } : bi,
+							             lock_freq: e2 ? { error: '' + (e2.text ?? e2) } : lf,
+							             bandfreq: e3 ? {} : bf });
+						});
+					});
+				});
+			}, (e, v) => {
+				if (e)
+					return reply_err(req, e);
+				// real H173 (C919) lte-band-info: supported/current come as hex band masks,
+				//   <supported_lte_band_list>, <current_lte_band>, <net_mode>
+				let bi = v.band_info ?? {};
+				let sup_mask = bi.supported_lte_band_list ?? bi.SupportedLteBand;
+				let cur_mask = bi.current_lte_band ?? bi.current_band ?? cache.netmode?.LTEBand;
+				// lock-freq: lte_info / nr_info each have lock_mode, freq_infos, all_bands; detect_info = auto-revert
+				let lf = v.lock_freq ?? {};
+				let lock = {
+					lte_lock: lf.lte_info?.lock_mode ?? null,
+					nr_lock: lf.nr_info?.lock_mode ?? null,
+					detect_enable: lf.detect_info?.detect_enable ?? null,
+					detect_time: lf.detect_info?.detect_time ?? null,
+					error: lf.error ?? null
+				};
+				// authoritative lists from bandfreqlist.xml (override the mask decode when present)
+				let bf = v.bandfreq ?? {};
+				let num_list = (s) => s ? filter(map(split('' + s, ','), (x) => +trim(x)), (n) => n > 0) : null;
+				let lte_sup = num_list(bf.lte_support_band_list);
+				let nr_sup = num_list(bf.nr_support_band_list);
+				let cell_lock_nr = num_list(bf.cell_lock_nr_band_list);
+				req.reply({ ok: true,
+					supported_lte: lte_sup ?? (sup_mask ? P.lte_mask_to_bands(sup_mask) : []),
+					supported_nr: nr_sup ?? [],
+					cell_lock_nr: cell_lock_nr ?? [],
+					current_lte_mask: cur_mask,
+					current_lte_bands: cur_mask ? P.lte_mask_to_bands(cur_mask) : [],
+					net_mode: bi.net_mode,
+					lock: lock,
+					serving: cache.signal?.band,
+					raw: v.band_info });
+			});
+		}
+	},
+
+	raw: {
+		args: { method: '', path: '', body: {}, xml: '' },
+		call: (req) => {
+			let a = req.args;
+			let path = '' + (a.path ?? '');
+			if (!match(path, /^\/(api|config)\/[A-Za-z0-9_\/.\-]+$/))
+				return { ok: false, error: 'path must look like /api/... or /config/...' };
+			req.defer();
+			let done = (e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v });
+			if (uc(a.method ?? 'GET') == 'POST')
+				sess.post(path, length(a.xml ?? '') ? a.xml : (a.body ?? {}), done);
+			else
+				sess.get(path, done);
+		}
+	},
+
+	config_get: {
+		call: (req) => snapshot().config
+	},
+
+	config_set: {
+		args: { enabled: true, host: '', username: '', password: '', interval: 0, history: 0, show_ids: true, sms_mode: '' },
+		call: (req) => {
+			if (!uci)
+				return { ok: false, error: 'uci module not available' };
+			let a = req.args, cur = uci.cursor();
+			if (!cur.get('h173', 'main'))
+				cur.set('h173', 'main', 'h173');
+			if (a.enabled != null)  cur.set('h173', 'main', 'enabled', a.enabled ? '1' : '0');
+			if (a.host)             cur.set('h173', 'main', 'host', a.host);
+			if (a.username)         cur.set('h173', 'main', 'username', a.username);
+			if (a.password != null && length(a.password))
+				cur.set('h173', 'main', 'password', a.password);
+			if (a.interval)         cur.set('h173', 'main', 'interval', '' + a.interval);
+			if (a.history)          cur.set('h173', 'main', 'history', '' + a.history);
+			if (a.show_ids != null) cur.set('h173', 'main', 'show_ids', a.show_ids ? '1' : '0');
+			if (a.sms_mode in [ 'auto', 'ecc', 'classic' ]) {
+				cur.set('h173', 'main', 'sms_mode', a.sms_mode);
+				sms_mode_used = null;
+			}
+			cur.commit('h173');
+			apply_config();
+			return { ok: true, config: snapshot().config };
+		}
+	}
+};
+
+
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
+
+uloop.init();
+
+conn = ubus.connect();
+if (!conn) {
+	warn('h173d: cannot connect to ubus\n');
+	exit(1);
+}
+
+if (!conn.publish('h173', methods)) {
+	warn('h173d: cannot publish ubus object h173: ' + ubus.error() + '\n');
+	exit(1);
+}
+
+warn(sprintf('h173d %s: polling %s every %ds\n', VERSION, cfg.host, cfg.interval));
+schedule();
+uloop.timer(500, () => poll(true));
+uloop.run();

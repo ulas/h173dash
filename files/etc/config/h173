@@ -1,0 +1,17 @@
+config h173 'main'
+	option enabled '1'
+	# H173-386 web address (in bridge mode see README: "Reaching the modem")
+	option host '192.168.8.1'
+	option username 'vodafone'
+	# modem web password; set it with:  uci set h173.main.password='...'; uci commit h173
+	option password ''
+	# poll interval in seconds (signal/traffic); cells every 3x, slow data every 12x
+	option interval '5'
+	# history samples kept in RAM (720 x 5s = 1 hour)
+	option history '720'
+	# show full IMEI/IMSI/ICCID in the dashboard (default: masked)
+	option show_ids '0'
+	# auto | socket | uclient   (auto = socket when ucode-mod-socket is installed)
+	option transport 'auto'
+	# SMS: auto | ecc (web UI method, encrypted) | classic (AI Life app method, plain)
+	option sms_mode 'auto'

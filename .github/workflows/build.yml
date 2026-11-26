@@ -1,0 +1,63 @@
+name: build-apk
+
+# Etiket (v*) push edince .apk üretir ve Release'e ekler. Elle de çalıştırılır.
+# Panel noarch (PKGARCH:=all) olduğundan herhangi bir apk-nesli SDK üretebilir;
+# çıktı mimariden bağımsızdır. SDK sürüm/hedefini aşağıdan değiştirebilirsiniz.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      sdk_url:
+        description: "OpenWrt SDK indirme URL'si (apk nesli)"
+        required: false
+        default: "https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/openwrt-sdk-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y zstd build-essential libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3
+
+      - name: Download & extract SDK
+        run: |
+          URL="${{ github.event.inputs.sdk_url || 'https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/openwrt-sdk-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst' }}"
+          echo "SDK: $URL"
+          wget -q "$URL" -O sdk.tar.zst
+          mkdir sdk && tar --use-compress-program=unzstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Build package
+        run: |
+          cp -r Makefile files sdk/package/ && mkdir -p sdk/package/h173dash \
+            && rm -rf sdk/package/h173dash && mkdir -p sdk/package/h173dash \
+            && cp -r Makefile files sdk/package/h173dash/
+          cd sdk
+          ./scripts/feeds update -a >/dev/null 2>&1 || true
+          ./scripts/feeds install -a >/dev/null 2>&1 || true
+          make defconfig
+          make package/h173dash/compile V=s
+
+      - name: Collect packages
+        run: |
+          mkdir -p out
+          find sdk/bin -name 'h173dash_*.apk' -o -name 'h173dash_*.ipk' | xargs -r -I{} cp {} out/
+          ls -la out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: h173dash-package
+          path: out/*
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
