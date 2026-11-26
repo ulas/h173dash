@@ -59,8 +59,11 @@ echo "==> Kaynak: $F ($BRANCH)"
 
 # 3) Dosyaları yerleştir
 echo "==> Panel + daemon yerleştiriliyor"
-mkdir -p /www/dash /usr/sbin /usr/libexec /etc/init.d /etc/uci-defaults \
+mkdir -p /usr/sbin /usr/libexec /etc/init.d /etc/uci-defaults \
          /usr/share/ucode/h173 /usr/share/rpcd/acl.d /etc/config
+# Dash: Vite hash'li dosya adları ürettiğinden, eski kurulum üzerine yazarken
+# eski JS/CSS paketleri birikmesin diye klasörü sıfırdan oluşturuyoruz (config'e dokunmaz).
+rm -rf /www/dash; mkdir -p /www/dash
 cp -rf "$F/www/dash/." /www/dash/
 cp -f  "$F/www/index.html" /www/index.html
 cp -f  "$F/usr/sbin/h173d" /usr/sbin/h173d

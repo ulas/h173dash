@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -689,6 +689,10 @@ const methods = {
 	},
 
 	// ids: "40001,40002"
+	// delete-sms / set-read, cihazın restfulconfig'inde send-sms ve sms-list-phone ile
+	// AYNI şifreli-erişim grubundadır (attr 257). Bu yüzden düz POST modem tarafından
+	// reddedilir; list/send gibi şifreli yol (enc-type 2 = istek gövdesi şifreli) üzerinden
+	// gönderip, şifreyi desteklemeyen modemler için klasik düz POST'a düşüyoruz.
 	sms_delete: {
 		args: { ids: '' },
 		call: (req) => {
@@ -696,8 +700,11 @@ const methods = {
 			if (!length(ids))
 				return { ok: false, error: 'ids required' };
 			req.defer();
-			sess.post('/api/sms/delete-sms', { Index: length(ids) == 1 ? ids[0] : ids },
-				(e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v }));
+			let body = { Index: length(ids) == 1 ? ids[0] : ids };
+			sms_dispatch('delete',
+				(k) => sess.post_enc('/api/sms/delete-sms', body, 2, (e, v) => k(e, e ? null : v)),
+				(k) => sess.post('/api/sms/delete-sms', body, (e, v) => k(e, e ? null : v)),
+				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, result: r }));
 		}
 	},
 
@@ -708,8 +715,11 @@ const methods = {
 			if (!length(ids))
 				return { ok: false, error: 'ids required' };
 			req.defer();
-			sess.post('/api/sms/set-read', { Index: ids },
-				(e, v) => e ? reply_err(req, e) : req.reply({ ok: true, result: v }));
+			let body = { Index: ids };
+			sms_dispatch('setread',
+				(k) => sess.post_enc('/api/sms/set-read', body, 2, (e, v) => k(e, e ? null : v)),
+				(k) => sess.post('/api/sms/set-read', body, (e, v) => k(e, e ? null : v)),
+				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, result: r }));
 		}
 	},
 
