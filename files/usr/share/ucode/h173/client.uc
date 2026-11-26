@@ -162,6 +162,25 @@ function http_socket(method, url, opts, done) {
 		done(null, { status: st ? +st[1] : 0, headers: hdrs, body: b });
 	}
 
+	// Bazı modem web sunucuları 'Connection: close' istemimize rağmen bağlantıyı
+	// açık tutar (keep-alive); o zaman EOF hiç gelmez ve istek boşuna zaman aşımına
+	// düşer (yanıt tam gelmiş olsa bile atılırdı). Yanıtı Content-Length / chunked
+	// sonuyla erkenden tamamlayıp bağlantı kapanmasını beklemiyoruz.
+	function complete() {
+		let data = join('', chunks);
+		let sep = index(data, '\r\n\r\n');
+		if (sep < 0)
+			return false;
+		let hd = substr(data, 0, sep);
+		let bodylen = length(data) - (sep + 4);
+		let cl = match(hd, /(^|\r\n)content-length:[ \t]*([0-9]+)/i);
+		if (cl)
+			return bodylen >= +cl[2];
+		if (match(hd, /(^|\r\n)transfer-encoding:[^\r\n]*chunked/i))
+			return index(substr(data, sep + 4), '0\r\n\r\n') >= 0;
+		return false;   // uzunluk bilinmiyor → EOF'a / zaman aşımına bırak
+	}
+
 	handle = uloop.handle(sock, (events) => {
 		let d = sock.recv(16384);
 		if (d == null)
@@ -169,6 +188,8 @@ function http_socket(method, url, opts, done) {
 		if (d == '')
 			return finish(null);
 		push(chunks, d);
+		if (complete())
+			return finish(null);
 	}, uloop.ULOOP_READ);
 
 	guard = uloop.timer(timeout, () => finish('timeout'));

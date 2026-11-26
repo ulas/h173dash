@@ -236,6 +236,11 @@ Kaldırmadan sonra tarayıcıyı **Ctrl+Shift+R** ile yenileyin.
 - `ucode-mod-socket` kurulu mu?  `apk info ucode-mod-socket` (yoksa `apk add ucode-mod-socket`)
 
 **Modem verisi gelmiyor / sinyal boş**
+- `ubus call h173 status` içinde `session.logged_in` **false** ve `last_error` **"timeout"** ise:
+  modem web sunucusu `Connection: close`'u yok sayıp bağlantıyı açık tutuyor olabilir
+  (keep-alive). **h173d 0.6.0** bunu Content-Length/chunked sonuyla erkenden tamamlayarak
+  çözer — daha eskiyse daemon'ı güncelleyin. `ping 192.168.8.1` ve tarayıcıdan erişim
+  çalışıyor ama daemon "timeout" diyorsa belirti tam budur.
 - Modem parolası doğru mu?  `uci get h173.main.password`
 - Router modemin web adresine erişiyor mu?  `ping 192.168.8.1`
 - Kullanıcı adı (`vodafone`/`admin`) ve `host` doğru mu?

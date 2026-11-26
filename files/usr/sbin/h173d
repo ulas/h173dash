@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.5.9';
+const VERSION = '0.6.0';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
