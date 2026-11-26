@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.6.1';
+const VERSION = '0.6.3';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -128,7 +128,8 @@ const POLLS = [
 	[ 'notify',      '/api/monitoring/check-notifications', 12 ],
 	[ 'smscount',    '/api/sms/sms-count',                  12 ],
 	[ 'device',      '/api/device/information',             60 ],
-	[ 'sim',         '/api/sim/sim-info',                   60 ],
+	// NOT: /api/sim/sim-info bu modemde erişime kapalı (100003). SIM durumu zaten
+	// açık olan /api/monitoring/status (SimStatus) + /api/pin/status'tan türetiliyor.
 	[ 'pin',         '/api/pin/status',                     60 ],
 	[ 'netmodelist', '/api/net/net-mode-list',             360 ],
 	[ 'bridge',      '/api/security/bridgemode',            60 ],
@@ -445,6 +446,26 @@ function apply_config() {
 /* ubus                                                                */
 /* ------------------------------------------------------------------ */
 
+// SIM durumu: /api/sim/sim-info bu modemde kapalı olduğundan, açık olan
+// /api/monitoring/status (SimStatus, simlockStatus) ve /api/pin/status'tan türetilir.
+function sim_info() {
+	let m = cache.monitor ?? {}, p = cache.pin ?? {};
+	let st = (m.SimStatus != null) ? +m.SimStatus : null;
+	let label = (st == 1) ? 'Hazır'
+		: (st == 0 || st == 255 || st == 240) ? 'SIM yok'
+		: (st == 2 || st == 3 || st == 4) ? 'Kısıtlı'
+		: (st == null) ? null : ('durum ' + st);
+	return {
+		present: st == 1,
+		status: st,
+		label,
+		locked: (m.simlockStatus != null) ? (+m.simlockStatus == 1) : null,
+		sim_state: (p.SimState != null) ? +p.SimState : null,
+		pin_tries: (p.SimPinTimes != null) ? +p.SimPinTimes : null,
+		puk_tries: (p.SimPukTimes != null) ? +p.SimPukTimes : null
+	};
+}
+
 function snapshot() {
 	return {
 		version: VERSION,
@@ -462,7 +483,8 @@ function snapshot() {
 		unsupported: keys(unsupported),
 		derived: {
 			lte_bands_allowed: P.lte_mask_to_bands(cache.netmode?.LTEBand),
-			sample: length(history) ? history[length(history) - 1] : null
+			sample: length(history) ? history[length(history) - 1] : null,
+			sim: sim_info()
 		},
 		router: router_info(),
 		ecdh_seconds,
@@ -536,6 +558,21 @@ function phone_list(s) {
  *  classic - what the Huawei AI Life app does: plain /api/sms/sms-list (BoxType 1 inbox, 2 outbox)
  * sms_mode 'auto' tries ecc first and falls back to classic when the device refuses it. */
 const SMS_FALLBACK = { nokey: 1, rsa: 1, ecdh: 1, decrypt: 1, '100002': 1, '100005': 1, '100006': 1, http404: 1, http400: 1 };
+
+// "Kayıt yok / boş liste" kodları: modem boş SMS deposunu sorgulayınca hata döndürür.
+// Bunları hata değil BOŞ LİSTE olarak ele alıyoruz. Klasik fallback'e DÜŞMÜYORUZ: o,
+// sms_mode_used'i 'classic' yapıp silme/okundu'yu düz (şifresiz) yola çevirir ve bu
+// modem onları reddeder. Liste okuması böylece ecc yolunda kalır.
+const SMS_EMPTY = { '100010': 1, '113017': 1, '113053': 1 };
+function sms_reply_list(req, e, r) {
+	if (e) {
+		let code = (type(e) == 'object') ? '' + (e.code ?? '') : '';
+		if (SMS_EMPTY[code])
+			return req.reply({ ok: true, mode: sms_mode_used, count: 0, messages: [] });
+		return reply_err(req, e);
+	}
+	req.reply({ ok: true, mode: sms_mode_used, ...r });
+}
 
 function sms_dispatch(name, ecc_fn, classic_fn, done) {
 	let mode = cfg.sms_mode ?? 'auto';
@@ -661,7 +698,7 @@ const methods = {
 			sms_dispatch('contacts',
 				(k) => sess.post_enc('/api/sms/sms-list-contact', body, 1, (e, v) => k(e, e ? null : sms_messages(v))),
 				classic_contacts,
-				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, mode: sms_mode_used, ...r }));
+				(e, r) => sms_reply_list(req, e, r));
 		}
 	},
 
@@ -676,7 +713,7 @@ const methods = {
 			sms_dispatch('thread',
 				(k) => sess.post_enc('/api/sms/sms-list-phone', body, 3, (e, v) => k(e, e ? null : sms_messages(v))),
 				(k) => classic_thread(phone, k),
-				(e, r) => e ? reply_err(req, e) : req.reply({ ok: true, mode: sms_mode_used, ...r }));
+				(e, r) => sms_reply_list(req, e, r));
 		}
 	},
 
