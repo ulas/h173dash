@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.5.7';
+const VERSION = '0.5.8';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -714,6 +714,7 @@ const methods = {
 	},
 
 	status: {
+		args: {},
 		call: (req) => snapshot()
 	},
 
@@ -737,6 +738,7 @@ const methods = {
 	},
 
 	scan_start: {
+		args: {},
 		call: (req) => {
 			if (scan.state == 'running')
 				return { ok: false, error: 'scan already running', started: scan.started };
@@ -757,12 +759,14 @@ const methods = {
 	},
 
 	scan_result: {
+		args: {},
 		call: (req) => scan
 	},
 
 	// Developer-mode band info (read-only): supported LTE bands + current lock-freq state.
 	// Uses a temporary developer-mode session; the poller re-logs in normally afterwards.
 	band_info: {
+		args: {},
 		call: (req) => {
 			req.defer();
 			sess.dev_op((api, done) => {
@@ -830,6 +834,7 @@ const methods = {
 	},
 
 	config_get: {
+		args: {},
 		call: (req) => snapshot().config
 	},
 
