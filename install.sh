@@ -87,11 +87,14 @@ if ! uci -q get uhttpd.main.ubus_prefix >/dev/null; then
 fi
 [ -f /etc/uci-defaults/90-h173 ] && ( cd /tmp; sh /etc/uci-defaults/90-h173 && rm -f /etc/uci-defaults/90-h173 )
 /etc/init.d/h173 enable
-/etc/init.d/h173 restart
+# İlk kurulumda servis henüz çalışmadığından 'restart' önce 'stop' dener ve procd
+# 'Command failed: Not found' (zararsız) yazar — bu yüzden stop'u susturup start'a düşüyoruz.
+/etc/init.d/h173 restart >/dev/null 2>&1 || /etc/init.d/h173 start
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart
 
-IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
+# 25.x ipaddr'ı CIDR ile dönebilir (192.168.1.1/24) — maske kısmını at.
+IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"; IP="${IP%%/*}"
 echo ""
 echo "==> Bitti. Panel:  http://$IP/   (giriş: root + router parolası)"
 echo "    Modem parolası ayarlı değilse:"
