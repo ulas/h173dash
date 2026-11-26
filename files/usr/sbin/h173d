@@ -19,7 +19,7 @@ import * as C from 'h173.client';
 let uci = null;
 try { uci = require('uci'); } catch (e) { uci = null; }
 
-const VERSION = '0.6.5';
+const VERSION = '0.6.6';
 
 /* ------------------------------------------------------------------ */
 /* configuration                                                       */
@@ -233,8 +233,15 @@ function router_info() {
 
 function store(key, e, v) {
 	if (e) {
-		errors[key] = e;
 		let code = (type(e) == 'object') ? e.code : '';
+		// Oturum/giriş seviyesindeki hatalar GLOBAL'dir (session.last_error +
+		// login_blocked_for'da zaten var). Her uç için ayrı ayrı yazıp Eylemler
+		// listesini aynı "login paused" satırıyla kirletmeyelim.
+		if (code == 'backoff' || code == 'nopass') {
+			delete errors[key];
+			return;
+		}
+		errors[key] = e;
 		if (code == '100002' || code == 'http404')
 			unsupported[key] = true;
 		return;
